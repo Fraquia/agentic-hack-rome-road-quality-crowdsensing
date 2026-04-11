@@ -1,0 +1,7 @@
+tensorflow>=2.12
+numpy
+pandas
+scikit-learn
+matplotlib
+h5py
+coremltools; sys_platform == 'darwin'

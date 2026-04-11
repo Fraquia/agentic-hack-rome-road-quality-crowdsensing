@@ -1,0 +1,38 @@
+name: road_quality
+description: Road Quality Monitor — rilevamento anomalie stradali via IMU on-device.
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: '>=3.10.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Sensori IMU
+  sensors_plus: ^4.0.2
+
+  # GPS
+  geolocator: ^10.1.0
+
+  # Inferenza TFLite on-device
+  tflite_flutter: ^0.12.0
+
+  # Upload batch anomalie
+  http: ^1.1.0
+
+  # Accesso percorso assets/file locali
+  path_provider: ^2.1.1
+
+  # Mappa OpenStreetMap
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/model.tflite
+    - assets/scaler.json

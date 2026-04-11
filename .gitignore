@@ -1,0 +1,88 @@
+# ── Dataset ──────────────────────────────────────────────────────────────────
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# ── Modelli trainati (binari pesanti) ────────────────────────────────────────
+models/*.h5
+models/*.tflite
+models/*.mlmodel
+models/history.json
+models/confusion_matrix.png
+# scaler.json è piccolo e utile → tracciato
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+.eggs/
+.venv/
+venv/
+env/
+.env
+.env.*
+*.env
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Flutter / Dart ────────────────────────────────────────────────────────────
+app/.dart_tool/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/.packages
+app/*.iml
+app/build/
+app/app.iml
+
+# Android
+app/android/.gradle/
+app/android/local.properties
+app/android/captures/
+app/android/gradlew
+app/android/gradlew.bat
+app/android/gradle/
+app/android/key.properties
+app/android/**/*.keystore
+app/android/**/*.jks
+app/android/app/debug.apk
+app/android/app/release/
+
+# iOS
+app/ios/Pods/
+app/ios/.symlinks/
+app/ios/Flutter/Flutter.framework
+app/ios/Flutter/Flutter.podspec
+app/ios/Flutter/App.framework
+app/ios/Flutter/Generated.xcconfig
+app/ios/Flutter/ephemeral/
+app/ios/Runner.xcworkspace/
+
+# Asset placeholder — il modello reale non va in repo
+app/assets/model.tflite
+
+# ── macOS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+
+# ── IDE ────────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+gonzale

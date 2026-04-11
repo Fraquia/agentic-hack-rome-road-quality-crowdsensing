@@ -1,0 +1,7 @@
+filename,label
+# Questo file è un placeholder dello schema.
+# Ogni riga mappa un file CSV in data/raw/ alla sua classe.
+# Classi valide: smooth, pothole, asphalt_bump, metal_bump, worn_road
+# Esempio:
+# recording_001.csv,smooth
+# recording_002.csv,pothole
