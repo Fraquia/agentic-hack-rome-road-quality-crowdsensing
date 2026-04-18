@@ -6,6 +6,8 @@ import 'sensor_collector.dart';
 import 'inference.dart';
 import 'windowing.dart';
 import 'gps_tagger.dart';
+import 'road_map_service.dart';
+import 'map_store.dart';
 
 class MonitorPage extends StatefulWidget {
   const MonitorPage({super.key});
@@ -15,17 +17,25 @@ class MonitorPage extends StatefulWidget {
 }
 
 class _MonitorPageState extends State<MonitorPage> {
-  final _store  = AnomalyStore();
-  final _sensor = SensorCollector();
-  final _voter  = WindowingVoter();
-  final _tagger = GpsTagger();
+  final _store      = AnomalyStore();
+  final _mapStore   = MapStore();
+  final _mapService = RoadMapService();
+  final _sensor     = SensorCollector();
+  final _voter      = WindowingVoter();
+  final _tagger     = GpsTagger();
 
   RoadInference? _inference;
   StreamSubscription<List<double>>? _windowSub;
+  StreamSubscription<GpsStatus>?    _statusSub;
 
-  bool   _running   = false;
-  String _lastLabel = '—';
-  double _lastConf  = 0.0;
+  // Anomalie confermate prima che il GPS fosse pronto.
+  final _pending = <({String roadClass, double confidence, DateTime timestamp})>[];
+
+  bool      _running       = false;
+  bool      _generatingMap = false;
+  String    _lastLabel     = '—';
+  double    _lastConf      = 0.0;
+  GpsStatus _gpsStatus     = GpsStatus.unavailable;
 
   @override
   void initState() {
@@ -49,7 +59,15 @@ class _MonitorPageState extends State<MonitorPage> {
       return;
     }
     try {
+      // Iscriversi allo stream GPS prima di start() per non perdere nessun evento.
+      _statusSub = _tagger.statusStream.listen((status) {
+        if (mounted) setState(() => _gpsStatus = status);
+        if (status == GpsStatus.ready) _drainPending();
+      });
+
       await _tagger.start();
+      // Sincronizzare lo stato attuale in caso di aggiornamento sincrono.
+      if (mounted) setState(() => _gpsStatus = _tagger.status);
 
       _windowSub = _sensor.windows.listen((window) {
         try {
@@ -74,6 +92,13 @@ class _MonitorPageState extends State<MonitorPage> {
                 timestamp:  DateTime.now(),
               ));
               if (mounted) setState(() {});
+            } else {
+              // GPS non ancora pronto: accoda per risoluzione appena disponibile.
+              _pending.add((
+                roadClass:  confirmed,
+                confidence: prediction.confidence,
+                timestamp:  DateTime.now(),
+              ));
             }
           }
         } catch (e) {
@@ -84,22 +109,83 @@ class _MonitorPageState extends State<MonitorPage> {
       _sensor.start();
       if (mounted) setState(() => _running = true);
     } catch (e) {
+      _statusSub?.cancel();
       _showError('Errore avvio: $e');
     }
+  }
+
+  /// Risolve le anomalie accumulate prima del primo fix GPS.
+  void _drainPending() {
+    final pos = _tagger.lastPosition;
+    if (pos == null || _pending.isEmpty) return;
+    for (final p in _pending) {
+      _store.add(Anomaly(
+        lat:        pos.latitude,
+        lon:        pos.longitude,
+        roadClass:  p.roadClass,
+        confidence: p.confidence,
+        timestamp:  p.timestamp,
+      ));
+    }
+    _pending.clear();
+    if (mounted) setState(() {});
   }
 
   Future<void> _stop() async {
     _sensor.stop();
     _windowSub?.cancel();
+    _statusSub?.cancel();
+    _pending.clear();
     await _tagger.flush(_store.anomalies);
     _tagger.stop();
     _voter.reset();
     if (mounted) {
       setState(() {
         _running   = false;
+        _gpsStatus = GpsStatus.unavailable;
         _lastLabel = '—';
         _lastConf  = 0.0;
       });
+    }
+  }
+
+  Future<void> _generateMap() async {
+    if (_store.count == 0) {
+      _showError('Nessuna anomalia raccolta. Avvia il monitoraggio prima.');
+      return;
+    }
+    setState(() => _generatingMap = true);
+    try {
+      final snapshot    = List<Anomaly>.from(_store.anomalies);
+      final tracePts    = _tagger.tracePoints;
+      final traceTs     = _tagger.traceTimestamps;
+      final data = await _mapService.build(snapshot, tracePts, traceTs);
+      _mapStore.add(GeneratedMap(
+        timestamp:    DateTime.now(),
+        anomalyCount: snapshot.length,
+        data:         data,
+      ));
+      if (mounted) {
+        setState(() => _generatingMap = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Mappa salvata! Aprila dalla tab Mappe.'),
+            backgroundColor: Colors.green,
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _generatingMap = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Errore generazione mappa: $e'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
     }
   }
 
@@ -113,6 +199,7 @@ class _MonitorPageState extends State<MonitorPage> {
   @override
   void dispose() {
     _stop();
+    _tagger.dispose();
     _sensor.dispose();
     _inference?.dispose();
     super.dispose();
@@ -142,7 +229,6 @@ class _MonitorPageState extends State<MonitorPage> {
               _StatusCard(label: _lastLabel, confidence: _lastConf),
               const SizedBox(height: 32),
 
-              // Contatore anomalie sessione
               Text(
                 'Anomalie rilevate: ${_store.count}',
                 style: Theme.of(context).textTheme.headlineSmall,
@@ -155,9 +241,10 @@ class _MonitorPageState extends State<MonitorPage> {
                   fontWeight: FontWeight.w600,
                 ),
               ),
+              const SizedBox(height: 6),
+              _GpsStatusRow(status: _gpsStatus, pendingCount: _pending.length),
               const SizedBox(height: 48),
 
-              // Bottone START / STOP
               FilledButton.icon(
                 onPressed: _running ? _stop : _start,
                 icon: Icon(_running ? Icons.stop : Icons.play_arrow),
@@ -177,10 +264,65 @@ class _MonitorPageState extends State<MonitorPage> {
                   ),
                 ),
               ),
+              const SizedBox(height: 16),
+              OutlinedButton.icon(
+                onPressed: (_generatingMap || _store.count == 0)
+                    ? null
+                    : _generateMap,
+                icon: _generatingMap
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.map_outlined),
+                label: Text(
+                  _generatingMap ? 'Generazione…' : 'Genera Mappa',
+                  style: const TextStyle(fontSize: 15),
+                ),
+                style: OutlinedButton.styleFrom(
+                  minimumSize: const Size(200, 48),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(24),
+                  ),
+                ),
+              ),
             ],
           ],
         ),
       ),
+    );
+  }
+}
+
+class _GpsStatusRow extends StatelessWidget {
+  final GpsStatus status;
+  final int       pendingCount;
+
+  const _GpsStatusRow({required this.status, required this.pendingCount});
+
+  @override
+  Widget build(BuildContext context) {
+    final (icon, color, text) = switch (status) {
+      GpsStatus.unavailable => (Icons.gps_off,       Colors.grey,   'GPS non disponibile'),
+      GpsStatus.acquiring   => (Icons.gps_not_fixed, Colors.orange, 'Acquisizione GPS…'),
+      GpsStatus.ready       => (Icons.gps_fixed,     Colors.green,  'GPS attivo'),
+    };
+
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(icon, size: 16, color: color),
+        const SizedBox(width: 4),
+        Text(text, style: TextStyle(color: color, fontSize: 13)),
+        if (pendingCount > 0) ...[
+          const SizedBox(width: 8),
+          Text(
+            '($pendingCount in coda)',
+            style: const TextStyle(color: Colors.orange, fontSize: 12),
+          ),
+        ],
+      ],
     );
   }
 }
@@ -217,7 +359,7 @@ class _StatusCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Card(
       elevation: 4,
-      color: _color.withOpacity(0.12),
+      color: _color.withValues(alpha: 0.12),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 28),
@@ -237,7 +379,7 @@ class _StatusCard extends StatelessWidget {
               const SizedBox(height: 6),
               Text(
                 '${(confidence * 100).toStringAsFixed(1)}%',
-                style: TextStyle(color: _color.withOpacity(0.7), fontSize: 16),
+                style: TextStyle(color: _color.withValues(alpha: 0.7), fontSize: 16),
               ),
             ],
           ],

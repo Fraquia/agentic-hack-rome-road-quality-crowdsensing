@@ -7,9 +7,9 @@ import 'anomaly.dart';
 
 /// Risultato del servizio mappa: strade colorate + marker anomalie.
 class RoadMapData {
-  final List<ColoredRoad> roads;
+  final List<ColoredRoad>   roads;
   final List<AnomalyMarker> markers;
-  final LatLng center;
+  final LatLng              center;
 
   const RoadMapData({
     required this.roads,
@@ -20,8 +20,8 @@ class RoadMapData {
 
 class ColoredRoad {
   final List<LatLng> points;
-  final Color color;
-  final double strokeWidth;
+  final Color        color;
+  final double       strokeWidth;
 
   const ColoredRoad({
     required this.points,
@@ -33,7 +33,7 @@ class ColoredRoad {
 class AnomalyMarker {
   final LatLng position;
   final String label;
-  final Color color;
+  final Color  color;
 
   const AnomalyMarker({
     required this.position,
@@ -43,130 +43,169 @@ class AnomalyMarker {
 }
 
 class RoadMapService {
-  static const String _overpassUrl = 'https://overpass-api.de/api/interpreter';
-  static const double _matchRadius = 25.0;   // metri
-  static const double _bboxBuffer  = 0.003;  // ~300 m di buffer intorno alle anomalie
+  static final RoadMapService _instance = RoadMapService._();
+  factory RoadMapService() => _instance;
+  RoadMapService._();
 
-  /// Interroga Overpass API e restituisce strade colorate in base alle anomalie.
-  Future<RoadMapData> build(List<Anomaly> anomalies) async {
-    if (anomalies.isEmpty) throw Exception('Nessuna anomalia da visualizzare');
+  static const String _osrmUrl           = 'https://router.project-osrm.org/match/v1/driving';
+  static const int    _maxTracePoints     = 100;   // cap per URL length
+  static const double _hotspotRadiusM     = 50.0;  // raggio entro cui colorare il percorso
 
-    final bbox = _computeBbox(anomalies);
-    final ways  = await _fetchRoads(bbox);
+  /// Costruisce la mappa: map matching via OSRM + overlay anomalie.
+  ///
+  /// [tracePoints] e [traceTimestamps] devono avere la stessa lunghezza.
+  /// Se la traccia è vuota, vengono mostrati solo i marker senza percorso.
+  Future<RoadMapData> build(
+    List<Anomaly> anomalies,
+    List<LatLng>  tracePoints,
+    List<int>     traceTimestamps,
+  ) async {
+    final valid = anomalies.where(_hasValidGps).toList();
+    if (valid.isEmpty) throw Exception('Nessuna anomalia con coordinate GPS valide');
 
-    final List<ColoredRoad> roads = [];
-    for (final way in ways) {
-      final pts = (way['geometry'] as List)
-          .map((g) => LatLng((g['lat'] as num).toDouble(), (g['lon'] as num).toDouble()))
-          .toList();
-      if (pts.length < 2) continue;
-
-      final severity = _worstSeverityNearWay(pts, anomalies);
-      if (severity < 0) continue; // nessuna anomalia vicina → non disegnare
-
-      roads.add(ColoredRoad(
-        points: pts,
-        color: _severityColor(severity),
-        strokeWidth: 6.0,
-      ));
+    List<LatLng> route = [];
+    if (tracePoints.length >= 2) {
+      route = await _matchRoute(tracePoints, traceTimestamps);
     }
 
-    final markers = anomalies.map((a) => AnomalyMarker(
+    final roads = <ColoredRoad>[];
+
+    if (route.isNotEmpty) {
+      // Percorso base grigio
+      roads.add(ColoredRoad(
+        points:      route,
+        color:       Colors.blueGrey.shade400,
+        strokeWidth: 4.0,
+      ));
+
+      // Hotspot colorati vicino a ogni anomalia
+      for (final a in valid) {
+        final idx = _nearestRouteIndex(LatLng(a.lat, a.lon), route);
+        if (idx < 0) continue;
+        final start = (idx - 4).clamp(0, route.length - 1);
+        final end   = (idx + 4).clamp(0, route.length - 1);
+        if (start >= end) continue;
+        roads.add(ColoredRoad(
+          points:      route.sublist(start, end + 1),
+          color:       _classColor(a.roadClass),
+          strokeWidth: 8.0,
+        ));
+      }
+    }
+
+    final markers = valid.map((a) => AnomalyMarker(
       position: LatLng(a.lat, a.lon),
       label:    a.roadClass,
       color:    _classColor(a.roadClass),
     )).toList();
 
-    final center = LatLng(
-      anomalies.map((a) => a.lat).reduce((a, b) => a + b) / anomalies.length,
-      anomalies.map((a) => a.lon).reduce((a, b) => a + b) / anomalies.length,
-    );
+    final center = route.isNotEmpty
+        ? route[route.length ~/ 2]
+        : LatLng(
+            valid.map((a) => a.lat).reduce((a, b) => a + b) / valid.length,
+            valid.map((a) => a.lon).reduce((a, b) => a + b) / valid.length,
+          );
 
     return RoadMapData(roads: roads, markers: markers, center: center);
   }
 
-  // ── Overpass ──────────────────────────────────────────────────────────────
+  // ── OSRM Match ────────────────────────────────────────────────────────────
 
-  Future<List<Map<String, dynamic>>> _fetchRoads(
-      Map<String, double> bbox) async {
-    final query = '''
-[out:json][timeout:25];
-way["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|service|living_street)\$"]
-  (${bbox['south']},${bbox['west']},${bbox['north']},${bbox['east']});
-out geom;
-''';
+  Future<List<LatLng>> _matchRoute(
+      List<LatLng> points, List<int> timestamps) async {
+    final (pts, ts) = _downsample(points, timestamps, _maxTracePoints);
 
-    final response = await http.post(
-      Uri.parse(_overpassUrl),
-      body: {'data': query},
+    final coords = pts
+        .map((p) => '${p.longitude.toStringAsFixed(6)},${p.latitude.toStringAsFixed(6)}')
+        .join(';');
+    final tsParam = ts.join(';');
+
+    final uri = Uri.parse(
+      '$_osrmUrl/$coords?geometries=geojson&overview=full&timestamps=$tsParam',
     );
 
+    late http.Response response;
+    try {
+      response = await http.get(uri).timeout(const Duration(seconds: 15));
+    } catch (e) {
+      throw Exception('Errore di rete OSRM: $e');
+    }
+
     if (response.statusCode != 200) {
-      throw Exception('Overpass API error ${response.statusCode}');
+      throw Exception('OSRM error ${response.statusCode}');
     }
 
     final decoded = json.decode(response.body) as Map<String, dynamic>;
-    return (decoded['elements'] as List)
-        .whereType<Map<String, dynamic>>()
-        .where((e) => e['type'] == 'way' && e['geometry'] != null)
-        .toList();
-  }
+    final code    = decoded['code'] as String;
 
-  Map<String, double> _computeBbox(List<Anomaly> anomalies) {
-    double minLat = anomalies.first.lat, maxLat = anomalies.first.lat;
-    double minLon = anomalies.first.lon, maxLon = anomalies.first.lon;
-    for (final a in anomalies) {
-      if (a.lat < minLat) minLat = a.lat;
-      if (a.lat > maxLat) maxLat = a.lat;
-      if (a.lon < minLon) minLon = a.lon;
-      if (a.lon > maxLon) maxLon = a.lon;
+    if (code == 'NoMatch') {
+      throw Exception(
+        'Nessuna strada trovata per il tracciato GPS. '
+        'Assicurati di aver guidato su strade mappate con GPS attivo.',
+      );
     }
-    return {
-      'south': minLat - _bboxBuffer,
-      'west':  minLon - _bboxBuffer,
-      'north': maxLat + _bboxBuffer,
-      'east':  maxLon + _bboxBuffer,
-    };
-  }
+    if (code != 'Ok') {
+      throw Exception('OSRM: ${decoded['message'] ?? code}');
+    }
 
-  // ── Matching anomalia ↔ strada ────────────────────────────────────────────
-
-  /// Restituisce la severità peggiore tra tutte le anomalie entro _matchRadius
-  /// da almeno un segmento della strada. -1 se nessuna.
-  int _worstSeverityNearWay(List<LatLng> pts, List<Anomaly> anomalies) {
-    int worst = -1;
-    for (final a in anomalies) {
-      for (int i = 0; i < pts.length - 1; i++) {
-        final d = _distanceToSegment(
-          LatLng(a.lat, a.lon), pts[i], pts[i + 1]);
-        if (d <= _matchRadius) {
-          final s = _severity(a.roadClass);
-          if (s > worst) worst = s;
-          break;
-        }
+    // Concatena tutti i matching (OSRM può spezzarli in caso di gap GPS)
+    final matchings = decoded['matchings'] as List;
+    final List<LatLng> route = [];
+    for (final m in matchings) {
+      for (final c in m['geometry']['coordinates'] as List) {
+        // GeoJSON: [longitude, latitude]
+        route.add(LatLng((c[1] as num).toDouble(), (c[0] as num).toDouble()));
       }
     }
-    return worst;
+    return route;
   }
 
-  /// Distanza in metri da punto P al segmento AB (proiezione locale).
-  double _distanceToSegment(LatLng p, LatLng a, LatLng b) {
-    const double degToM = 111320.0;
-    final double cosLat = cos(a.latitude * pi / 180.0);
+  /// Riduce la traccia a [maxCount] punti campionando uniformemente.
+  (List<LatLng>, List<int>) _downsample(
+      List<LatLng> pts, List<int> ts, int maxCount) {
+    if (pts.length <= maxCount) return (pts, ts);
+    final step = (pts.length / maxCount).ceil();
+    final outPts = <LatLng>[];
+    final outTs  = <int>[];
+    for (int i = 0; i < pts.length; i += step) {
+      outPts.add(pts[i]);
+      outTs.add(ts[i]);
+    }
+    if (outPts.last != pts.last) {
+      outPts.add(pts.last);
+      outTs.add(ts.last);
+    }
+    return (outPts, outTs);
+  }
 
-    final double px = (p.longitude - a.longitude) * degToM * cosLat;
-    final double py = (p.latitude  - a.latitude)  * degToM;
-    final double bx = (b.longitude - a.longitude) * degToM * cosLat;
-    final double by = (b.latitude  - a.latitude)  * degToM;
+  // ── Geometria ─────────────────────────────────────────────────────────────
 
-    final double lenSq = bx * bx + by * by;
-    if (lenSq == 0) return sqrt(px * px + py * py);
+  /// Indice del punto del percorso più vicino a [point] entro [_hotspotRadiusM],
+  /// oppure -1 se nessun punto è abbastanza vicino.
+  int _nearestRouteIndex(LatLng point, List<LatLng> route) {
+    int nearest = -1;
+    double minDist = _hotspotRadiusM;
+    for (int i = 0; i < route.length; i++) {
+      final d = _distanceBetween(point, route[i]);
+      if (d < minDist) { minDist = d; nearest = i; }
+    }
+    return nearest;
+  }
 
-    final double t = max(0.0, min(1.0, (px * bx + py * by) / lenSq));
-    final double dx = px - t * bx;
-    final double dy = py - t * by;
+  double _distanceBetween(LatLng a, LatLng b) {
+    const degToM = 111320.0;
+    final cosLat = cos(a.latitude * pi / 180.0);
+    final dx = (a.longitude - b.longitude) * degToM * cosLat;
+    final dy = (a.latitude  - b.latitude)  * degToM;
     return sqrt(dx * dx + dy * dy);
   }
+
+  // ── Validazione GPS ───────────────────────────────────────────────────────
+
+  bool _hasValidGps(Anomaly a) =>
+      a.lat.isFinite && a.lon.isFinite &&
+      a.lat >= -90  && a.lat <= 90 &&
+      a.lon >= -180 && a.lon <= 180;
 
   // ── Colori ────────────────────────────────────────────────────────────────
 
@@ -182,11 +221,10 @@ out geom;
 
   Color _severityColor(int severity) {
     switch (severity) {
-      case 0:  return Colors.green;
       case 1:  return Colors.yellow.shade700;
       case 2:  return Colors.orange;
       case 3:  return Colors.red;
-      default: return Colors.grey;
+      default: return Colors.green;
     }
   }
 

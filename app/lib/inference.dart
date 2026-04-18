@@ -47,14 +47,20 @@ class RoadInference {
   }
 
   RoadPrediction predict(List<double> window) {
-    assert(window.length == _windowSize,
-        'Finestra deve avere $_windowSize campioni (trovati ${window.length})');
+    if (window.length != _windowSize) {
+      throw ArgumentError(
+          'Finestra deve avere $_windowSize campioni (trovati ${window.length})');
+    }
 
     final normalised = window.map((v) => (v - _mean) / _std).toList();
     final input  = [normalised.map((v) => [v]).toList()];
     final output = List.generate(1, (_) => List<double>.filled(5, 0.0));
 
-    _interpreter.run(input, output);
+    try {
+      _interpreter.run(input, output);
+    } catch (e) {
+      throw Exception('Errore TFLite durante inferenza: $e');
+    }
 
     final probs  = output[0];
     final maxIdx = probs.indexOf(probs.reduce(max));
